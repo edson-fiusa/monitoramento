@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fazer pedido</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --txt:#1c1e21; --mut:#6b7280; --bd:#e5e7eb; --ok:#16a34a; --at:#d97706; --cr:#dc2626; --btn:#2563eb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#181b21; --txt:#e8eaed; --mut:#9aa0a6; --bd:#2a2e36; --ok:#4ade80; --at:#fbbf24; --cr:#f87171; --btn:#3b82f6; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:16px; background:var(--card); border-bottom:1px solid var(--bd); display:flex; justify-content:space-between; align-items:center; }
+  header a { color:var(--btn); text-decoration:none; font-size:14px; }
+  main { max-width:520px; margin:16px auto; padding:0 12px; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:14px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:12px 0 4px; } label:first-child { margin-top:0; }
+  input, select { width:100%; padding:12px; font-size:16px; border:1px solid var(--bd); border-radius:8px; background:var(--bg); color:var(--txt); }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  .rapidos { display:flex; gap:6px; margin-top:8px; }
+  .rapidos button { flex:1; padding:8px 0; font-size:14px; background:var(--bg); color:var(--txt); border:1px solid var(--bd); border-radius:8px; }
+  button.go { width:100%; margin-top:14px; padding:14px; font-size:16px; font-weight:600; border:0; border-radius:10px; background:var(--btn); color:#fff; }
+  button:disabled { opacity:.5; }
+  #dica { margin-top:10px; font-size:14px; font-weight:600; }
+  .OK { color:var(--ok); } .ATENCAO { color:var(--at); } .CRITICO { color:var(--cr); }
+  #res { margin-top:12px; padding:12px; border-radius:8px; border:2px solid var(--bd); font-size:14px; display:none; line-height:1.5; }
+  .hist div { font-size:13px; padding:6px 0; border-bottom:1px solid var(--bd); display:flex; justify-content:space-between; }
+  h3 { margin:0 0 4px; font-size:16px; } .sub { font-size:12px; color:var(--mut); }
+  progress { width:100%; height:10px; margin-top:10px; }
+</style>
+</head>
+<body>
+<header><b>🛒 Fazer pedido</b><a id="linkMonitor" href="/monitor" target="_blank">Abrir monitor →</a></header>
+<main>
+
+  <div class="card">
+    <label>Endereço do servidor (Render)</label>
+    <input id="srv" placeholder="https://seu-app.onrender.com" inputmode="url" autocapitalize="off">
+    <div class="sub" style="margin-top:4px">Se você abriu esta página pelo próprio servidor, pode deixar como está.</div>
+
+    <label>O que você quer pedir?</label>
+    <select id="item">
+      <option>Carro</option><option>Comida</option><option>Pizza</option><option>Bebida</option><option>Outro</option>
+    </select>
+
+    <label>Quantidade</label>
+    <input id="qtd" type="number" min="1" max="500" value="5" inputmode="numeric">
+    <div class="rapidos">
+      <button onclick="qtd.value=5;prever()">5</button><button onclick="qtd.value=10;prever()">10</button>
+      <button onclick="qtd.value=15;prever()">15</button><button onclick="qtd.value=20;prever()">20</button>
+      <button onclick="qtd.value=30;prever()">30</button>
+    </div>
+    <div id="dica"></div>
+
+    <button class="go" id="enviar">Enviar pedido</button>
+    <div id="res"></div>
+  </div>
+
+  <div class="card">
+    <h3>Simular muitos IPs</h3>
+    <div class="sub">Envia vários pedidos, cada um com um IP diferente (falso), para ver o monitor reagir.</div>
+    <div class="row" style="margin-top:10px">
+      <div><label>Pedidos</label><input id="simN" type="number" min="1" max="200" value="15"></div>
+      <div><label>IPs diferentes</label><input id="simIps" type="number" min="1" max="50" value="6"></div>
+      <div><label>Unid. por pedido</label><input id="simQ" type="number" min="1" max="100" value="3"></div>
+    </div>
+    <button class="go" id="simular" style="background:var(--at)">Simular tráfego</button>
+    <progress id="prog" value="0" max="1" style="display:none"></progress>
+    <div class="sub" id="simMsg" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card hist"><h3>Meus últimos envios</h3><div id="hist"><span class="sub">Nenhum ainda.</span></div></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const srv = $('srv'), qtd = $('qtd');
+const NOME = { OK: 'OK', ATENCAO: 'ATENÇÃO', CRITICO: 'CRÍTICO' };
+const LIM_ATENCAO = 11, LIM_CRITICO = 20; // so para a previsao na tela; quem decide e o servidor
+
+srv.value = localStorage.getItem('servidor') || (location.protocol.startsWith('http') ? location.origin : '');
+
+function base() { return srv.value.trim().replace(/\/+$/, ''); }
+function atualizarLink() { $('linkMonitor').href = (base() || '') + '/monitor'; }
+srv.addEventListener('input', () => { localStorage.setItem('servidor', srv.value.trim()); atualizarLink(); });
+atualizarLink();
+
+function prever() {
+  const q = Number(qtd.value);
+  const n = q >= LIM_CRITICO ? 'CRITICO' : q >= LIM_ATENCAO ? 'ATENCAO' : 'OK';
+  $('dica').className = n;
+  $('dica').textContent = q > 0 ? `Com ${q} unidade(s) o pedido fica: ${NOME[n]}` : '';
+}
+qtd.addEventListener('input', prever); prever();
+
+async function enviarPedido(corpo) {
+  if (!base() && !location.protocol.startsWith('http')) throw new Error('Informe o endereço do servidor acima.');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 70000); // plano gratis do Render pode demorar ~1 min para acordar
+  try {
+    const r = await fetch(base() + '/api/pedido', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(corpo), signal: ctrl.signal,
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.erro || 'Erro ' + r.status);
+    return j;
+  } finally { clearTimeout(timer); }
+}
+
+function guardarHistorico(j) {
+  const h = $('hist');
+  if (h.querySelector('span')) h.innerHTML = '';
+  const d = document.createElement('div');
+  d.innerHTML = `<span>${j.quantidade} × ${j.item.replace(/[<>&]/g, '')}</span><b class="${j.nivelPedido}">${NOME[j.nivelPedido]}</b>`;
+  h.prepend(d);
+  while (h.children.length > 8) h.lastChild.remove();
+}
+
+$('enviar').addEventListener('click', async () => {
+  const btn = $('enviar'), res = $('res');
+  btn.disabled = true; btn.textContent = 'Enviando...';
+  res.style.display = 'block'; res.style.borderColor = 'var(--bd)'; res.textContent = 'Enviando...';
+  const aviso = setTimeout(() => { res.textContent = 'Servidor acordando... (plano gratuito do Render, pode levar até 1 minuto)'; }, 4000);
+  try {
+    const j = await enviarPedido({ item: $('item').value, quantidade: Number(qtd.value) });
+    res.style.borderColor = `var(--${{ OK: 'ok', ATENCAO: 'at', CRITICO: 'cr' }[j.nivelPedido]})`;
+    res.innerHTML = `<b>Pedido #${j.id} recebido!</b><br>${j.quantidade} × ${j.item} → <b class="${j.nivelPedido}">${NOME[j.nivelPedido]}</b><br>
+      Carga do sistema: <b>${j.carga.pct}%</b> (${j.carga.unidades} un. no último minuto)<br>
+      Situação do sistema: <b class="${j.statusSistema}">${NOME[j.statusSistema]}</b><br>
+      <span class="sub">Seu IP: ${j.ip}</span>`;
+    guardarHistorico(j);
+  } catch (e) {
+    res.style.borderColor = 'var(--cr)';
+    res.textContent = 'Falhou: ' + (e.name === 'AbortError' ? 'o servidor não respondeu a tempo.' : e.message);
+  } finally { clearTimeout(aviso); btn.disabled = false; btn.textContent = 'Enviar pedido'; }
+});
+
+// ---- simulacao de varios IPs ----
+const rnd = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+const ipFalso = () => `${rnd(11, 223)}.${rnd(0, 255)}.${rnd(0, 255)}.${rnd(1, 254)}`;
+
+$('simular').addEventListener('click', async () => {
+  const n = Number($('simN').value), nIps = Math.max(1, Number($('simIps').value)), q = Number($('simQ').value);
+  const ips = Array.from({ length: nIps }, ipFalso);
+  const btn = $('simular'), prog = $('prog'), msg = $('simMsg');
+  btn.disabled = true; prog.style.display = 'block'; prog.max = n; prog.value = 0;
+  let ok = 0;
+  try {
+    for (let i = 0; i < n; i++) {
+      const j = await enviarPedido({ item: $('item').value, quantidade: q, ipSimulado: ips[i % ips.length] });
+      ok++; prog.value = i + 1; msg.textContent = `Enviado ${ok}/${n} · sistema: ${NOME[j.statusSistema]} · carga ${j.carga.pct}%`;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    msg.textContent += ' · concluído!';
+  } catch (e) { msg.textContent = 'Parou: ' + e.message; }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>
