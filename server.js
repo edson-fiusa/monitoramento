@@ -282,7 +282,7 @@ async function atualizar(){
     grafico('gRam', h.map(function(x){return x.ram}), s.ram.limiteMB, '--ok');
 
     $('ips').innerHTML = s.pedidos.porIp.map(function(x){
-      return '<tr><td>'+esc(x.ip)+(x.simulado?:'')+'</td><td>'+x.pedidos+'</td><td>'+x.unidades+'</td><td>há '+x.ultimoHaSeg+' s</td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
+      return '<tr><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+x.pedidos+'</td><td>'+x.unidades+'</td><td>há '+x.ultimoHaSeg+' s</td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
     }).join('') || '<tr><td colspan="5">Nenhum pedido no último minuto.</td></tr>';
 
     $('ultimos').innerHTML = s.pedidos.ultimos.map(function(x){
