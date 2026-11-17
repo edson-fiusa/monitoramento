@@ -17,6 +17,8 @@ const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 11);    // unidades na jan
 const LIM_CRITICO = Number(process.env.LIM_CRITICO || 20);    // unidades na janela: >= 20 -> CRITICO
 const IP_ATENCAO = Number(process.env.IP_ATENCAO || 5);       // pedidos de um mesmo IP na janela
 const IP_CRITICO = Number(process.env.IP_CRITICO || 10);
+const IP_BLOQUEIO = Number(process.env.IP_BLOQUEIO || 15);    // pedidos do mesmo IP/min -> 429 (bloqueado)
+const MAX_RETIDO_MB = Number(process.env.MAX_RETIDO_MB || 300); // teto de RAM retida pelo simulador
 const RAM_LIMITE_MB = Number(process.env.RAM_LIMITE_MB || 512); // plano gratis do Render = 512 MB
 const SIMULAR_CARGA = process.env.SIMULAR_CARGA !== 'false';  // pedido grande gasta CPU/RAM de verdade (para o monitor reagir)
 
@@ -69,17 +71,30 @@ setInterval(() => {
   pedidos = pedidos.filter((p) => p.t >= corte).slice(-2000);
 }, 2000).unref();
 
-// ================= SIMULA TRABALHO (para o CPU/RAM reagirem ao tamanho do pedido) =================
-function simularTrabalho(q) {
+// ================= SIMULA TRABALHO (CPU, RAM e latencia reagem ao pedido) =================
+const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// teste: '' (normal) | 'cpu' | 'ram' | 'lento' | 'erro'
+async function simularTrabalho(q, teste) {
   if (!SIMULAR_CARGA) return;
-  const fim = Date.now() + Math.min(300, q * 5); // CPU: 5 ms por unidade (max 300 ms)
+
+  // CPU: trava o processo (sobe CPU e event loop)
+  const msCpu = teste === 'cpu' ? Math.min(2500, q * 40) : Math.min(400, q * 6);
+  const fim = Date.now() + msCpu;
   while (Date.now() < fim) Math.sqrt(Math.random());
-  const bytes = q * 512 * 1024;                  // RAM: 0,5 MB por unidade, liberada em 30 s
-  if (retidoBytes + bytes <= 150 * 1048576) {
+
+  // RAM: segura memoria por 30 s
+  const mb = teste === 'ram' ? Math.max(40, q) : q * 0.5;
+  const bytes = Math.floor(mb * 1048576);
+  if (retidoBytes + bytes <= MAX_RETIDO_MB * 1048576) {
     let buf = Buffer.alloc(bytes, 1);
     retidoBytes += bytes;
     setTimeout(() => { buf = null; retidoBytes -= bytes; }, 30_000).unref();
   }
+
+  // LATENCIA: demora para responder (sobe o p95)
+  const msEspera = teste === 'lento' ? Math.min(4000, q * 100) : Math.min(1500, q * 20);
+  await dorme(msEspera);
 }
 
 // ================= SNAPSHOT (o que o /monitor mostra) =================
@@ -306,19 +321,36 @@ function lerBody(req) {
   });
 }
 
-function criarPedido(body, req) {
+async function criarPedido(body, req) {
   const item = String(body.item || 'Carro').trim().slice(0, 30) || 'Carro';
   const quantidade = Number(body.quantidade);
   if (!Number.isInteger(quantidade) || quantidade < 1 || quantidade > 500)
     return { status: 400, dados: { erro: 'quantidade deve ser um numero inteiro de 1 a 500' } };
 
+  const teste = ['cpu', 'ram', 'lento', 'erro'].includes(body.teste) ? body.teste : '';
   const simulado = ipValido(body.ipSimulado);            // para simular muitos IPs diferentes
   const ip = simulado ? body.ipSimulado : ipDoCliente(req);
-  const nivel = nivelQtd(quantidade);
 
+  // 429 (4xx): mesmo IP mandando demais
+  const corte = Date.now() - JANELA_S * 1000;
+  const doIp = pedidos.filter((p) => p.ip === ip && p.t >= corte).length;
+  if (doIp >= IP_BLOQUEIO)
+    return { status: 429, dados: { erro: 'IP ' + ip + ' bloqueado: ' + doIp + ' pedidos no último minuto' } };
+
+  // 503 (5xx): sistema critico recusa parte dos pedidos
+  if (unidadesNaJanela() >= LIM_CRITICO && Math.random() < 0.3)
+    return { status: 503, dados: { erro: 'servidor sobrecarregado, tente de novo' } };
+
+  // 500 (5xx): erro forcado pelo teste
+  if (teste === 'erro') {
+    await dorme(200);
+    return { status: 500, dados: { erro: 'falha simulada (teste de erro)' } };
+  }
+
+  const nivel = nivelQtd(quantidade);
   pedidos.push({ t: Date.now(), ip, item, quantidade, nivel, simulado });
   totalPedidos++; totalUnidades += quantidade;
-  simularTrabalho(quantidade);
+  await simularTrabalho(quantidade, teste);
 
   const unidades = unidadesNaJanela();
   return { status: 201, dados: {
@@ -354,7 +386,7 @@ http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && caminho === '/api/monitor') dados = snapshot();
     else if (req.method === 'GET' && caminho === '/health') dados = { status: 'ok' };
-    else if (req.method === 'POST' && caminho === '/api/pedido') ({ status, dados } = criarPedido(await lerBody(req), req));
+    else if (req.method === 'POST' && caminho === '/api/pedido') ({ status, dados } = await criarPedido(await lerBody(req), req));
     else if (req.method === 'POST' && caminho === '/api/reset') {
       pedidos = []; reqEventos = []; historico.length = 0;
       totalReq = totalPedidos = totalUnidades = 0; classes['2xx'] = classes['4xx'] = classes['5xx'] = 0;

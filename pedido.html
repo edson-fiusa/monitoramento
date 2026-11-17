@@ -68,6 +68,28 @@
     <div class="sub" id="simMsg" style="margin-top:6px"></div>
   </div>
 
+  <div class="card">
+    <h3>Teste de estresse</h3>
+    <div class="sub">Dispara pedidos em massa e mostra o resultado. Veja o /monitor reagir ao mesmo tempo.</div>
+    <label>Tipo de teste</label>
+    <select id="tTipo">
+      <option value="carga">📦 Pico de carga (pedidos grandes)</option>
+      <option value="cpu">🔥 CPU (processamento pesado)</option>
+      <option value="ram">🧠 Memória (segura RAM)</option>
+      <option value="lento">🐢 Latência (respostas lentas)</option>
+      <option value="erro">💥 Erros 5xx (falhas forçadas)</option>
+      <option value="spam">🚫 Spam de um IP só (gera 429)</option>
+      <option value="mistura">🎲 Mistura de tudo</option>
+    </select>
+    <div class="row">
+      <div><label>Total de pedidos</label><input id="tN" type="number" min="1" max="200" value="30"></div>
+      <div><label>Ao mesmo tempo</label><input id="tC" type="number" min="1" max="20" value="5"></div>
+    </div>
+    <button class="go" id="tIr" style="background:var(--cr)">Iniciar teste</button>
+    <progress id="tProg" value="0" max="1" style="display:none"></progress>
+    <div id="tRes" class="sub" style="margin-top:8px;line-height:1.6"></div>
+  </div>
+
   <div class="card hist"><h3>Meus últimos envios</h3><div id="hist"><span class="sub">Nenhum ainda.</span></div></div>
 </main>
 
@@ -175,6 +197,61 @@ $('simular').addEventListener('click', async () => {
     msg.textContent += ' · concluído!';
   } catch (e) { msg.textContent = 'Parou: ' + e.message; }
   btn.disabled = false;
+});
+
+// ---- teste de estresse ----
+const PERFIS = {
+  carga: () => ({ quantidade: 30 }),
+  cpu:   () => ({ quantidade: 50, teste: 'cpu' }),
+  ram:   () => ({ quantidade: 100, teste: 'ram' }),
+  lento: () => ({ quantidade: 40, teste: 'lento' }),
+  erro:  () => ({ quantidade: 5, teste: 'erro' }),
+  spam:  () => ({ quantidade: 2 }),
+};
+const SORTEIO = ['carga', 'cpu', 'ram', 'lento', 'erro'];
+
+async function disparar(corpo) {
+  const t0 = performance.now();
+  try {
+    const r = await fetch(base() + '/api/pedido', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(corpo) });
+    await r.text();
+    return { status: r.status, ms: performance.now() - t0 };
+  } catch { return { status: 0, ms: performance.now() - t0 }; }
+}
+
+$('tIr').addEventListener('click', async () => {
+  const tipo = $('tTipo').value, n = Number($('tN').value), c = Math.max(1, Number($('tC').value));
+  const btn = $('tIr'), prog = $('tProg'), out = $('tRes');
+  const ipFixo = ipFalso();
+  const r = { ok: 0, e4: 0, e5: 0, rede: 0, ms: [] };
+  let feitos = 0, prox = 0;
+  btn.disabled = true; prog.style.display = 'block'; prog.max = n; prog.value = 0;
+
+  const mostrar = (fim) => {
+    const med = r.ms.length ? r.ms.reduce((a, b) => a + b, 0) / r.ms.length : 0;
+    out.innerHTML = `${fim ? '✅ Concluído' : 'Rodando...'} ${feitos}/${n}<br>` +
+      `<b class="OK">${r.ok} ok</b> · <b class="ATENCAO">${r.e4} bloqueados (4xx)</b> · <b class="CRITICO">${r.e5} erros (5xx)</b>` +
+      (r.rede ? ` · ${r.rede} sem resposta` : '') +
+      `<br>Tempo médio ${med.toFixed(0)} ms · máximo ${Math.max(0, ...r.ms).toFixed(0)} ms`;
+  };
+
+  async function trabalhador() {
+    while (prox < n) {
+      prox++;
+      const perfil = tipo === 'mistura' ? SORTEIO[rnd(0, SORTEIO.length - 1)] : tipo;
+      const corpo = { item: $('item').value, ...PERFIS[perfil]() };
+      corpo.ipSimulado = tipo === 'spam' ? ipFixo : ipFalso();
+      const x = await disparar(corpo);
+      feitos++; prog.value = feitos;
+      if (x.status === 0) r.rede++;
+      else if (x.status < 300) r.ok++;
+      else if (x.status < 500) r.e4++;
+      else r.e5++;
+      r.ms.push(x.ms); mostrar(false);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(c, n) }, trabalhador));
+  mostrar(true); btn.disabled = false;
 });
 </script>
 </body>
