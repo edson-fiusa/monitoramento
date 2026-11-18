@@ -1,42 +1,33 @@
+
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { monitorEventLoopDelay } = require('perf_hooks');
-const { createClient } = require('@supabase/supabase-js');
 
 const PORTA = process.env.PORT || 3000;
-const JANELA_S = Number(process.env.JANELA_S || 60);
-const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 11);
-const LIM_CRITICO = Number(process.env.LIM_CRITICO || 20);
-const IP_ATENCAO = Number(process.env.IP_ATENCAO || 5);
+const JANELA_S = Number(process.env.JANELA_S || 60);          // a "carga" conta os pedidos dos ultimos 60 s
+const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 11);    // unidades na janela: >= 11 -> ATENCAO
+const LIM_CRITICO = Number(process.env.LIM_CRITICO || 20);    // unidades na janela: >= 20 -> CRITICO
+const IP_ATENCAO = Number(process.env.IP_ATENCAO || 5);       // pedidos de um mesmo IP na janela
 const IP_CRITICO = Number(process.env.IP_CRITICO || 10);
-const IP_BLOQUEIO = Number(process.env.IP_BLOQUEIO || 15);
-const MAX_RETIDO_MB = Number(process.env.MAX_RETIDO_MB || 300);
-const RAM_LIMITE_MB = Number(process.env.RAM_LIMITE_MB || 512);
-const SIMULAR_CARGA = process.env.SIMULAR_CARGA !== 'false';
+const IP_BLOQUEIO = Number(process.env.IP_BLOQUEIO || 15);    // pedidos do mesmo IP/min -> 429 (bloqueado)
+const MAX_RETIDO_MB = Number(process.env.MAX_RETIDO_MB || 300); // teto de RAM retida pelo simulador
+const RAM_LIMITE_MB = Number(process.env.RAM_LIMITE_MB || 512); // plano gratis do Render = 512 MB
+const SIMULAR_CARGA = process.env.SIMULAR_CARGA !== 'false';  // pedido grande gasta CPU/RAM de verdade (para o monitor reagir)
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('Faltam SUPABASE_URL e SUPABASE_KEY (ou SUPABASE_ANON_KEY) nas variaveis de ambiente.');
-  process.exit(1);
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
-
-let dbEscritas = 0, dbLeituras = 0;
-let msUltimaEscrita = 0, msUltimaLeitura = 0;
-let dbTamanhoMB = 0, dbPaginas = 0, dbPaginasLivres = 0, dbWalMB = 0;
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+const SUPABASE_KEY = (process.env.SUPABASE_KEY || '').trim();
+const DB_ATIVO = Boolean(SUPABASE_URL && SUPABASE_KEY);
+const DB_TIMEOUT_MS = Number(process.env.DB_TIMEOUT_MS || 8000);
+const DB_FILA_MAX = Number(process.env.DB_FILA_MAX || 1000);  // pedidos esperando para gravar (se passar, descarta os mais antigos)
 
 const iniciadoEm = Date.now();
-let reqEventos = [];
+let pedidos = [];          // {t, ip, item, quantidade, nivel, simulado}
+let reqEventos = [];       // {t, ms, status}
 let totalReq = 0, totalPedidos = 0, totalUnidades = 0;
 const classes = { '2xx': 0, '4xx': 0, '5xx': 0 };
-const historico = [];
+const historico = [];      // {t, carga, cpu, ram, rps}
 let cpuPct = 0, rpsAtual = 0;
 let retidoBytes = 0;
 
@@ -48,122 +39,138 @@ const nivelQtd = (q) => nivelFaixa(q, LIM_ATENCAO, LIM_CRITICO);
 const ORDEM = { OK: 0, ATENCAO: 1, CRITICO: 2 };
 const pior = (lista) => lista.reduce((a, b) => (ORDEM[b] > ORDEM[a] ? b : a), 'OK');
 
-async function inserirPedido(t, ip, item, quantidade, nivel, simulado) {
-  const ini = process.hrtime.bigint();
-  const { error } = await supabase.from('pedidos').insert({
-    t: new Date(t).toISOString(),
-    ip, item, quantidade, nivel, simulado,
-  });
-  msUltimaEscrita = Number(process.hrtime.bigint() - ini) / 1e6;
-  dbEscritas++;
-  if (error) throw new Error('supabase insert pedido: ' + error.message);
+const db = {
+  ok: null,                // null = ainda nao testou | true | false
+  ultimoErro: '', ultimoErroEm: 0,
+  fila: [],                // pedidos esperando para gravar
+  gravados: 0, erros: 0, descartados: 0,
+  lat: [],                 // {t, ms} de cada chamada ao banco
+  gravando: false,
+  ultimoPing: 0, tamanhoMB: null, conexoes: null, linhasPedidos: null, linhasMetricas: null,
+};
+
+async function dbFetch(caminho, { method = 'GET', body, prefer } = {}) {
+  const headers = { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' };
+  if (SUPABASE_KEY.startsWith('eyJ')) headers.Authorization = 'Bearer ' + SUPABASE_KEY; // chave antiga (JWT)
+  if (prefer) headers.Prefer = prefer;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DB_TIMEOUT_MS);
+  const t0 = Date.now();
+  try {
+    const r = await fetch(SUPABASE_URL + '/rest/v1/' + caminho, {
+      method, headers, signal: ctrl.signal, body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const txt = await r.text();
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + txt.slice(0, 140));
+    db.ok = true;
+    return txt ? JSON.parse(txt) : null;
+  } catch (e) {
+    db.ok = false; db.erros++; db.ultimoErroEm = Date.now();
+    db.ultimoErro = e.name === 'AbortError' ? 'timeout (sem resposta em ' + DB_TIMEOUT_MS / 1000 + ' s)' : String(e.message || e).slice(0, 160);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    db.lat.push({ t: Date.now(), ms: Date.now() - t0 });
+    if (db.lat.length > 500) db.lat.splice(0, db.lat.length - 500);
+  }
 }
 
-async function unidadesNaJanela() {
-  const ini = process.hrtime.bigint();
-  const { data, error } = await supabase.rpc('unidades_na_janela', { segundos: JANELA_S });
-  msUltimaLeitura = Number(process.hrtime.bigint() - ini) / 1e6;
-  dbLeituras++;
-  if (error) throw new Error('supabase unidades_na_janela: ' + error.message);
-  return Number(data || 0);
+function dbLatencia() {
+  const corte = Date.now() - JANELA_S * 1000;
+  const ms = db.lat.filter((x) => x.t >= corte).map((x) => x.ms).sort((a, b) => a - b);
+  return {
+    p95: ms.length ? ms[Math.min(ms.length - 1, Math.floor(ms.length * 0.95))] : 0,
+    ultima: db.lat.length ? db.lat[db.lat.length - 1].ms : 0,
+  };
 }
 
-async function contarPedidosIp(ip) {
-  const { data, error } = await supabase.rpc('contar_pedidos_ip', { p_ip: ip, segundos: JANELA_S });
-  dbLeituras++;
-  if (error) throw new Error('supabase contar_pedidos_ip: ' + error.message);
-  return Number(data || 0);
+// pedido aceito -> entra na fila; a fila e gravada em lote a cada 2 s (o cliente nao espera o banco)
+function enfileirar(p, teste) {
+  if (!DB_ATIVO) return;
+  db.fila.push({ criado_em: new Date(p.t).toISOString(), ip: p.ip, item: p.item, quantidade: p.quantidade,
+    nivel: p.nivel, simulado: p.simulado, teste: teste || '' });
+  if (db.fila.length > DB_FILA_MAX) { const sobra = db.fila.length - DB_FILA_MAX; db.fila.splice(0, sobra); db.descartados += sobra; }
 }
 
-async function pedidosPorIp() {
-  const ini = process.hrtime.bigint();
-  const { data, error } = await supabase.rpc('pedidos_por_ip_janela', { segundos: JANELA_S });
-  msUltimaLeitura = Number(process.hrtime.bigint() - ini) / 1e6;
-  dbLeituras++;
-  if (error) throw new Error('supabase pedidos_por_ip_janela: ' + error.message);
-  return data || [];
+async function gravarFila() {
+  if (!DB_ATIVO || db.gravando || !db.fila.length) return;
+  db.gravando = true;
+  const lote = db.fila.splice(0, 200);
+  try {
+    await dbFetch('pedidos', { method: 'POST', body: lote, prefer: 'return=minimal' });
+    db.gravados += lote.length;
+  } catch {
+    db.fila.unshift(...lote);                                  // falhou: devolve para tentar de novo
+    if (db.fila.length > DB_FILA_MAX) { const sobra = db.fila.length - DB_FILA_MAX; db.fila.splice(0, sobra); db.descartados += sobra; }
+  } finally { db.gravando = false; }
 }
 
-async function metricasDb() {
-  const { data, error } = await supabase.rpc('metricas_banco');
-  dbLeituras++;
-  if (error) return { tamanho_mb: 0, paginas: 0, paginas_livres: 0, wal_mb: 0 };
-  return Array.isArray(data) ? data[0] : data;
+let pingN = 0;
+async function pingBanco() {
+  if (!DB_ATIVO) return;
+  try {
+    const s = await dbFetch('rpc/stats_banco', { method: 'POST', body: {} });  // tamanho, conexoes, linhas
+    db.tamanhoMB = s.tamanho_mb; db.conexoes = s.conexoes;
+    db.linhasPedidos = s.linhas_pedidos; db.linhasMetricas = s.linhas_metricas; db.ultimoPing = Date.now();
+    const x = snapshot();
+    await dbFetch('metricas', { method: 'POST', prefer: 'return=minimal', body: {
+      status: x.status.nivel, carga_pct: x.carga.pct, cpu_pct: x.cpu.pct, ram_mb: x.ram.rssMB, ram_pct: x.ram.pct,
+      p95_ms: x.requisicoes.p95Ms, rps: x.requisicoes.rps, erros_5xx: x.requisicoes.erros5xx,
+      db_p95_ms: x.banco.p95Ms, db_fila: x.banco.fila } });
+    if (++pingN % 360 === 0) await dbFetch('rpc/limpar_antigos', { method: 'POST', body: { dias: 7 } }); // ~1x por hora
+  } catch { /* o erro ja ficou registrado em db.ultimoErro */ }
 }
 
-async function inserirMetrica(t) {
-  const ini = process.hrtime.bigint();
-  const { error } = await supabase.from('db_metricas').insert({
-    t: new Date(t).toISOString(),
-    tamanho_mb: dbTamanhoMB,
-    paginas: dbPaginas,
-    paginas_livres: dbPaginasLivres,
-    wal_mb: dbWalMB,
-    escritas: dbEscritas,
-    leituras: dbLeituras,
-    ms_ultima_escrita: +msUltimaEscrita.toFixed(3),
-    ms_ultima_leitura: +msUltimaLeitura.toFixed(3),
-  });
-  msUltimaEscrita = Number(process.hrtime.bigint() - ini) / 1e6;
-  dbEscritas++;
-  if (error) console.error('erro metrica:', error.message);
-}
+if (DB_ATIVO) {
+  setInterval(gravarFila, 2000).unref();
+  setInterval(pingBanco, 10000).unref();
+  setTimeout(pingBanco, 1000).unref();
+  console.log('Banco: Supabase ativo (' + SUPABASE_URL + ')');
+} else console.log('Banco: desativado (defina SUPABASE_URL e SUPABASE_KEY para gravar os dados)');
 
-async function limparAntigos() {
-  const { error } = await supabase.rpc('limpar_pedidos_antigos');
-  dbLeituras++;
-  if (error) console.error('erro limpeza:', error.message);
-}
-
+// ================= AMOSTRAGEM (a cada 2 s): CPU, RAM, req/s =================
 let cpuAnt = process.cpuUsage();
 let tAnt = process.hrtime.bigint();
 let totalAnt = 0;
-let unidadesCache = 0;
 
-setInterval(async () => {
+function unidadesNaJanela() {
+  const corte = Date.now() - JANELA_S * 1000;
+  return pedidos.reduce((s, p) => (p.t >= corte ? s + p.quantidade : s), 0);
+}
+
+setInterval(() => {
   const agora = process.hrtime.bigint();
   const cpu = process.cpuUsage(cpuAnt);
   cpuPct = Math.min(100, ((cpu.user + cpu.system) / (Number(agora - tAnt) / 1e3)) * 100);
   cpuAnt = process.cpuUsage(); tAnt = agora;
   rpsAtual = (totalReq - totalAnt) / 2; totalAnt = totalReq;
 
-  try {
-    const m = await metricasDb();
-    if (m) {
-      dbTamanhoMB = Number(m.tamanho_mb || 0);
-      dbPaginas = Number(m.paginas || 0);
-      dbPaginasLivres = Number(m.paginas_livres || 0);
-      dbWalMB = Number(m.wal_mb || 0);
-    }
-    unidadesCache = await unidadesNaJanela();
-  } catch (e) {
-    console.error('amostragem:', e.message);
-  }
-
   historico.push({
     t: Date.now(),
-    carga: +((unidadesCache / LIM_CRITICO) * 100).toFixed(1),
+    carga: +((unidadesNaJanela() / LIM_CRITICO) * 100).toFixed(1),
     cpu: +cpuPct.toFixed(1),
     ram: +(process.memoryUsage().rss / 1048576).toFixed(1),
     rps: +rpsAtual.toFixed(1),
   });
   if (historico.length > 90) historico.shift();
 
-  try {
-    await inserirMetrica(Date.now());
-    await limparAntigos();
-  } catch (e) {
-    console.error('metricas:', e.message);
-  }
+  const corte = Date.now() - 10 * 60 * 1000; // guarda 10 min de pedidos
+  pedidos = pedidos.filter((p) => p.t >= corte).slice(-2000);
 }, 2000).unref();
 
+// ================= SIMULA TRABALHO (CPU, RAM e latencia reagem ao pedido) =================
 const dorme = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// teste: '' (normal) | 'cpu' | 'ram' | 'lento' | 'erro'
 async function simularTrabalho(q, teste) {
   if (!SIMULAR_CARGA) return;
+
+  // CPU: trava o processo (sobe CPU e event loop)
   const msCpu = teste === 'cpu' ? Math.min(2500, q * 40) : Math.min(400, q * 6);
   const fim = Date.now() + msCpu;
   while (Date.now() < fim) Math.sqrt(Math.random());
+
+  // RAM: segura memoria por 30 s
   const mb = teste === 'ram' ? Math.max(40, q) : q * 0.5;
   const bytes = Math.floor(mb * 1048576);
   if (retidoBytes + bytes <= MAX_RETIDO_MB * 1048576) {
@@ -171,34 +178,36 @@ async function simularTrabalho(q, teste) {
     retidoBytes += bytes;
     setTimeout(() => { buf = null; retidoBytes -= bytes; }, 30_000).unref();
   }
+
+  // LATENCIA: demora para responder (sobe o p95)
   const msEspera = teste === 'lento' ? Math.min(4000, q * 100) : Math.min(1500, q * 20);
   await dorme(msEspera);
 }
 
-async function snapshot() {
+// ================= SNAPSHOT (o que o /monitor mostra) =================
+function snapshot() {
   const agora = Date.now();
-  const corte = new Date(agora - JANELA_S * 1000).toISOString();
+  const corte = agora - JANELA_S * 1000;
+  const jan = pedidos.filter((p) => p.t >= corte);
+  const unidades = jan.reduce((s, p) => s + p.quantidade, 0);
 
-  const { data: jan, error: errJan } = await supabase
-    .from('pedidos').select('t,ip,item,quantidade,nivel,simulado')
-    .gte('t', corte).order('t', { ascending: false }).limit(2000);
-  dbLeituras++;
-  if (errJan) throw new Error('supabase pedidos janela: ' + errJan.message);
-
-  const unidades = (jan || []).reduce((s, p) => s + p.quantidade, 0);
   const dist = { OK: 0, ATENCAO: 0, CRITICO: 0 };
-  (jan || []).forEach((p) => dist[p.nivel]++);
+  jan.forEach((p) => dist[p.nivel]++);
   const pct = {};
   for (const k of Object.keys(dist)) pct[k] = jan.length ? +((dist[k] / jan.length) * 100).toFixed(1) : 0;
 
-  const porIpBruto = await pedidosPorIp();
-  const porIp = porIpBruto.map((x) => ({
-    ip: x.ip, pedidos: Number(x.pedidos), unidades: Number(x.unidades), simulado: !!x.simulado,
-    ultimoHaSeg: Math.round((agora - new Date(x.ultimo).getTime()) / 1000),
-    nivel: nivelFaixa(Number(x.pedidos), IP_ATENCAO, IP_CRITICO),
-  }));
+  const mapa = new Map();
+  for (const p of jan) {
+    const x = mapa.get(p.ip) || { ip: p.ip, pedidos: 0, unidades: 0, ultimo: 0, simulado: p.simulado };
+    x.pedidos++; x.unidades += p.quantidade; x.ultimo = Math.max(x.ultimo, p.t);
+    mapa.set(p.ip, x);
+  }
+  const porIp = [...mapa.values()]
+    .sort((a, b) => b.pedidos - a.pedidos || b.unidades - a.unidades)
+    .map((x) => ({ ip: x.ip, pedidos: x.pedidos, unidades: x.unidades, simulado: x.simulado,
+      ultimoHaSeg: Math.round((agora - x.ultimo) / 1000), nivel: nivelFaixa(x.pedidos, IP_ATENCAO, IP_CRITICO) }));
 
-  reqEventos = reqEventos.filter((e) => e.t >= agora - JANELA_S * 1000);
+  reqEventos = reqEventos.filter((e) => e.t >= corte);
   const ms = reqEventos.map((e) => e.ms).sort((a, b) => a - b);
   const p95 = ms.length ? ms[Math.min(ms.length - 1, Math.floor(ms.length * 0.95))] : 0;
   const erros5xx = reqEventos.filter((e) => e.status >= 500).length;
@@ -208,12 +217,12 @@ async function snapshot() {
   const cargaPct = (unidades / LIM_CRITICO) * 100;
   const maxIp = porIp.length ? porIp[0].pedidos : 0;
 
-  const nivelDb = {
-    tamanho: nivelFaixa(dbTamanhoMB, 200, 400),
-    escrita: nivelFaixa(msUltimaEscrita, 20, 50),
-    leitura: nivelFaixa(msUltimaLeitura, 20, 50),
-    wal: nivelFaixa(dbWalMB, 50, 100),
-  };
+  const dbLat = dbLatencia();
+  const nivelBanco = !DB_ATIVO ? 'OK' : pior([
+    db.ok === false ? 'CRITICO' : 'OK',
+    nivelFaixa(dbLat.p95, 300, 800),
+    nivelFaixa(db.fila.length, 100, 500),
+  ]);
 
   const nivel = {
     carga: nivelQtd(unidades),
@@ -222,9 +231,8 @@ async function snapshot() {
     latencia: nivelFaixa(p95, 500, 1000),
     erros: nivelFaixa(erros5xx, 1, 5),
     ip: nivelFaixa(maxIp, IP_ATENCAO, IP_CRITICO),
-    db: pior(Object.values(nivelDb)),
+    banco: nivelBanco,
   };
-
   const motivos = [];
   const txt = { ATENCAO: 'ATENÇÃO', CRITICO: 'CRÍTICO' };
   const add = (k, texto) => { if (nivel[k] !== 'OK') motivos.push(texto + ' → ' + txt[nivel[k]]); };
@@ -234,24 +242,9 @@ async function snapshot() {
   add('latencia', 'Latência p95 de ' + p95.toFixed(0) + ' ms');
   add('erros', erros5xx + ' erro(s) 5xx no último minuto');
   add('ip', 'IP ' + (porIp[0] ? porIp[0].ip : '') + ' fez ' + maxIp + ' pedidos no último minuto');
-  add('db', 'Banco: ' + dbTamanhoMB + ' MB, escrita ' + msUltimaEscrita.toFixed(1) + ' ms, leitura ' + msUltimaLeitura.toFixed(1) + ' ms');
-
-  const { data: ultimosRaw } = await supabase
-    .from('pedidos').select('t,ip,item,quantidade,nivel,simulado')
-    .order('t', { ascending: false }).limit(12);
-  dbLeituras++;
-  const ultimos = (ultimosRaw || []).map((p) => ({
-    haSeg: Math.round((agora - new Date(p.t).getTime()) / 1000),
-    ip: p.ip, item: p.item, quantidade: p.quantidade, nivel: p.nivel, simulado: !!p.simulado,
-  }));
-
-  const { count: totalNoBanco } = await supabase
-    .from('pedidos').select('*', { count: 'exact', head: true });
-  dbLeituras++;
-
-  const { data: metricasDbRaw } = await supabase
-    .from('db_metricas').select('*').order('t', { ascending: false }).limit(90);
-  dbLeituras++;
+  add('banco', db.ok === false
+    ? 'Banco de dados com problema: ' + db.ultimoErro
+    : 'Banco de dados lento/atrasado (p95 ' + dbLat.p95.toFixed(0) + ' ms, fila ' + db.fila.length + ')');
 
   return {
     uptimeSeg: Math.floor((agora - iniciadoEm) / 1000),
@@ -261,34 +254,30 @@ async function snapshot() {
     limites: { atencao: LIM_ATENCAO, critico: LIM_CRITICO },
     carga: { unidades, pct: +cargaPct.toFixed(1) },
     pedidos: {
-      total: totalPedidos, unidadesTotal: totalUnidades, noBanco: totalNoBanco || 0,
-      janela: { qtd: jan.length, unidades, ipsDistintos: porIpBruto.length, distribuicao: dist, pct },
-      porIp,
-      ultimos,
+      total: totalPedidos, unidadesTotal: totalUnidades,
+      janela: { qtd: jan.length, unidades, ipsDistintos: mapa.size, distribuicao: dist, pct },
+      porIp: porIp.slice(0, 10),
+      ultimos: pedidos.slice(-12).reverse().map((p) => ({
+        haSeg: Math.round((agora - p.t) / 1000), ip: p.ip, item: p.item, quantidade: p.quantidade, nivel: p.nivel, simulado: p.simulado })),
     },
     requisicoes: { total: totalReq, rps: +rpsAtual.toFixed(1), p95Ms: +p95.toFixed(1), erros5xx, classes },
     cpu: { pct: +cpuPct.toFixed(1), cores: os.cpus().length, load1: +os.loadavg()[0].toFixed(2) },
     ram: { rssMB: +(mem.rss / 1048576).toFixed(1), heapMB: +(mem.heapUsed / 1048576).toFixed(1),
       limiteMB: RAM_LIMITE_MB, pct: +ramPct.toFixed(1),
       maquinaTotalMB: Math.round(os.totalmem() / 1048576), maquinaLivreMB: Math.round(os.freemem() / 1048576) },
-    eventLoopMs: Number.isFinite(loop.mean) ? +(loop.mean / 1e6).toFixed(1) : 0,
     banco: {
-      provedor: 'supabase',
-      tamanhoMB: dbTamanhoMB, paginas: dbPaginas, paginasLivres: dbPaginasLivres, walMB: dbWalMB,
-      escritas: dbEscritas, leituras: dbLeituras,
-      msUltimaEscrita: +msUltimaEscrita.toFixed(3), msUltimaLeitura: +msUltimaLeitura.toFixed(3),
-      niveis: nivelDb,
-      historico: (metricasDbRaw || []).reverse().map((m) => ({
-        t: new Date(m.t).getTime(), tamanhoMB: Number(m.tamanho_mb), paginas: Number(m.paginas),
-        paginasLivres: Number(m.paginas_livres), walMB: Number(m.wal_mb),
-        escritas: Number(m.escritas), leituras: Number(m.leituras),
-        msEscrita: Number(m.ms_ultima_escrita), msLeitura: Number(m.ms_ultima_leitura),
-      })),
+      configurado: DB_ATIVO, ok: db.ok, p95Ms: +dbLat.p95.toFixed(1), ultimaMs: dbLat.ultima,
+      fila: db.fila.length, gravados: db.gravados, erros: db.erros, descartados: db.descartados,
+      ultimoErro: db.ultimoErro, ultimoErroHaSeg: db.ultimoErroEm ? Math.round((agora - db.ultimoErroEm) / 1000) : null,
+      tamanhoMB: db.tamanhoMB, conexoes: db.conexoes, linhasPedidos: db.linhasPedidos, linhasMetricas: db.linhasMetricas,
+      pingHaSeg: db.ultimoPing ? Math.round((agora - db.ultimoPing) / 1000) : null,
     },
+    eventLoopMs: Number.isFinite(loop.mean) ? +(loop.mean / 1e6).toFixed(1) : 0,
     historico,
   };
 }
 
+// ================= PAGINA /monitor (HTML dentro do proprio server.js) =================
 const PAGINA_MONITOR = String.raw`<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Monitor ao vivo</title>
@@ -315,7 +304,7 @@ canvas{width:100%;height:130px;display:block}
 .dist{display:flex;height:26px;border-radius:6px;overflow:hidden;background:var(--bd)}.dist div{display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:600;transition:width .4s}
 .leg{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px}
 </style></head><body>
-<div class="top"><div><h1>📡 Monitor ao vivo</h1><div class="sub" id="info">Conectando...</div></div>
+<div class="top"><div><h1>📡 Monitor ao vivo</h1><div class="sub" id="info">Conectando... (no plano gratuito do Render o servidor pode levar ~1 min para acordar)</div></div>
 <div><a href="/pedido">Fazer pedido →</a> &nbsp; <button class="link" onclick="zerar()">Zerar dados</button></div></div>
 
 <div id="banner"><div class="t" id="bTitulo">...</div><ul id="bMotivos"></ul></div>
@@ -333,19 +322,16 @@ canvas{width:100%;height:130px;display:block}
 <div class="card"><div class="lbl">Memória RAM (MB)</div><canvas id="gRam"></canvas></div>
 </div>
 
-<h2>Banco de dados (Supabase)</h2>
-<div class="grid" id="dbCards"></div>
-<div class="charts" style="margin-top:12px">
-<div class="card"><div class="lbl">Tamanho do banco (MB)</div><canvas id="gDbTam"></canvas></div>
-<div class="card"><div class="lbl">Latência de escrita (ms)</div><canvas id="gDbEscrita"></canvas></div>
-<div class="card"><div class="lbl">Latência de leitura (ms)</div><canvas id="gDbLeitura"></canvas></div>
-</div>
-
 <h2>Pedidos por IP (último minuto)</h2>
 <div class="card wrap"><table><thead><tr><th>IP</th><th>Pedidos</th><th>Unidades</th><th>Último</th><th>Nível</th></tr></thead><tbody id="ips"></tbody></table></div>
 
 <h2>Últimos pedidos</h2>
 <div class="card wrap"><table><thead><tr><th>Quando</th><th>IP</th><th>Item</th><th>Qtd</th><th>Nível</th></tr></thead><tbody id="ultimos"></tbody></table></div>
+
+<h2>Banco de dados (Supabase)</h2>
+<div class="grid" id="dbCards"></div>
+<div class="card wrap" style="margin-top:12px"><div class="lbl" style="margin-bottom:6px">Últimos pedidos gravados no banco</div>
+<table><thead><tr><th>#</th><th>Quando</th><th>IP</th><th>Item</th><th>Qtd</th><th>Nível</th></tr></thead><tbody id="dbRows"></tbody></table></div>
 
 <h2>Requisições</h2>
 <div class="grid" id="reqs"></div>
@@ -357,6 +343,7 @@ var NOME = {OK:'OK',ATENCAO:'Atenção',CRITICO:'Crítico'};
 var COR = {OK:'var(--ok)',ATENCAO:'var(--at)',CRITICO:'var(--cr)'};
 var TITULO = {OK:'✅ SISTEMA OK',ATENCAO:'⚠️ SISTEMA EM ATENÇÃO',CRITICO:'🚨 SISTEMA CRÍTICO'};
 var css = function(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()};
+
 function card(titulo, valor, pct, nivel, sub){
   return '<div class="card" style="border-top:4px solid '+COR[nivel]+'"><div class="lbl">'+titulo+'</div><div class="val">'+valor+
     '</div><div class="barra"><i style="width:'+Math.min(100,pct)+'%;background:'+COR[nivel]+'"></i></div><div class="sub" style="margin-top:6px">'+sub+'</div></div>';
@@ -373,7 +360,29 @@ function grafico(id, dados, max, cor){
   dados.forEach(function(v,i){var x=34+((w-34)*i)/Math.max(1,dados.length-1), y=10+(h-20)*(1-Math.min(v,max)/max); if(i){g.lineTo(x,y)}else{g.moveTo(x,y)}});
   g.stroke();
 }
-async function zerar(){ if(confirm('Apagar pedidos e métricas?')){ await fetch('/api/reset',{method:'POST'}); atualizar(); } }
+async function zerar(){ if(confirm('Apagar pedidos e métricas da memória? (os dados gravados no banco são mantidos)')){ await fetch('/api/reset',{method:'POST'}); atualizar(); } }
+
+function cardsBanco(b, nivel){
+  if(!b.configurado) return simples('Banco de dados','não configurado','defina SUPABASE_URL e SUPABASE_KEY no Render');
+  var valor = b.ok===false ? 'OFFLINE' : b.ok===null ? 'testando...' : b.p95Ms+' ms';
+  var sub = 'fila '+b.fila+' · gravados '+b.gravados+' · erros '+b.erros+(b.descartados?' · perdidos '+b.descartados:'');
+  var c = card('Banco: latência p95', valor, b.ok===false?100:b.p95Ms/8, nivel, sub);
+  if(b.ok===false) c += simples('Último erro', '<span style="font-size:14px">'+esc(b.ultimoErro)+'</span>', 'há '+b.ultimoErroHaSeg+' s');
+  c += simples('Dados no banco', (b.linhasPedidos===null?'?':b.linhasPedidos)+' pedidos', (b.linhasMetricas===null?'?':b.linhasMetricas)+' registros de métricas');
+  c += simples('Tamanho do banco', (b.tamanhoMB===null?'?':b.tamanhoMB+' MB'), 'plano gratuito: 500 MB');
+  c += simples('Conexões', b.conexoes===null?'?':b.conexoes, b.pingHaSeg===null?'sem leitura ainda':'lido há '+b.pingHaSeg+' s');
+  return c;
+}
+
+async function atualizarBanco(){
+  try{
+    var r = await (await fetch('/api/banco/pedidos')).json();
+    $('dbRows').innerHTML = (r.linhas||[]).map(function(x){
+      return '<tr><td>'+x.id+'</td><td>'+new Date(x.criado_em).toLocaleTimeString()+'</td><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+esc(x.item)+'</td><td><b>'+x.quantidade+'</b></td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
+    }).join('') || '<tr><td colspan="6">'+(r.erro ? esc(r.erro) : 'Nenhum pedido gravado ainda.')+'</td></tr>';
+  }catch(e){ $('dbRows').innerHTML = '<tr><td colspan="6">Não foi possível ler o banco.</td></tr>'; }
+}
+
 async function atualizar(){
   try{
     var s = await (await fetch('/api/monitor')).json();
@@ -381,6 +390,7 @@ async function atualizar(){
     $('info').textContent = 'Ao vivo · atualiza a cada 1 s · ligado há '+Math.floor(s.uptimeSeg/60)+' min '+(s.uptimeSeg%60)+' s · janela de '+s.janelaSeg+' s';
     $('banner').className = s.status.nivel; $('bTitulo').textContent = TITULO[s.status.nivel];
     $('bMotivos').innerHTML = s.status.motivos.map(function(m){return '<li>'+esc(m)+'</li>'}).join('') || '<li>Tudo funcionando normalmente.</li>';
+
     var n = s.niveis;
     $('cards').innerHTML =
       card('Carga de pedidos', s.carga.pct.toFixed(0)+'%', s.carga.pct, n.carga, s.carga.unidades+' un. no último minuto (atenção ≥ '+s.limites.atencao+', crítico ≥ '+s.limites.critico+')') +
@@ -389,6 +399,9 @@ async function atualizar(){
       card('Latência p95', s.requisicoes.p95Ms+' ms', s.requisicoes.p95Ms/10, n.latencia, 'event loop: '+s.eventLoopMs+' ms') +
       card('Erros 5xx', s.requisicoes.erros5xx, s.requisicoes.erros5xx*20, n.erros, 'no último minuto') +
       card('IP mais ativo', s.pedidos.porIp.length ? s.pedidos.porIp[0].pedidos+' pedidos' : '0', s.pedidos.porIp.length ? s.pedidos.porIp[0].pedidos*10 : 0, n.ip, s.pedidos.janela.ipsDistintos+' IP(s) diferentes');
+
+    $('dbCards').innerHTML = cardsBanco(s.banco, n.banco);
+
     var j = s.pedidos.janela, p = j.pct;
     $('dist').innerHTML = j.qtd ? ['OK','ATENCAO','CRITICO'].map(function(k){
       return p[k] ? '<div style="width:'+p[k]+'%;background:'+COR[k]+'">'+(p[k]>=8 ? p[k].toFixed(0)+'%' : '')+'</div>' : '';}).join('')
@@ -396,25 +409,19 @@ async function atualizar(){
     $('legenda').innerHTML = ['OK','ATENCAO','CRITICO'].map(function(k){
       return '<span><span class="tag '+k+'">'+NOME[k]+'</span> '+p[k].toFixed(1)+'% ('+j.distribuicao[k]+')</span>';}).join('') +
       '<span class="sub">Total: '+j.qtd+' pedidos · '+j.unidades+' unidades</span>';
+
     grafico('gCarga', h.map(function(x){return x.carga}), Math.max(100, Math.max.apply(null,h.map(function(x){return x.carga}))), '--at');
     grafico('gCpu', h.map(function(x){return x.cpu}), 100, '--a');
     grafico('gRam', h.map(function(x){return x.ram}), s.ram.limiteMB, '--ok');
-    var b = s.banco, bh = b.historico;
-    $('dbCards').innerHTML =
-      card('Tamanho do banco', b.tamanhoMB+' MB', b.tamanhoMB/4, b.niveis.tamanho, b.paginas+' páginas · '+b.paginasLivres+' livres') +
-      card('Escrita (última)', b.msUltimaEscrita+' ms', b.msUltimaEscrita*2, b.niveis.escrita, b.escritas+' escritas desde que ligou') +
-      card('Leitura (última)', b.msUltimaLeitura+' ms', b.msUltimaLeitura*2, b.niveis.leitura, b.leituras+' leituras desde que ligou') +
-      card('WAL', b.walMB+' MB', b.walMB, b.niveis.wal, 'journal do Postgres') +
-      simples('Pedidos no banco', s.pedidos.noBanco, 'persistidos no Supabase');
-    grafico('gDbTam', bh.map(function(x){return x.tamanhoMB}), Math.max(10, Math.max.apply(null,bh.map(function(x){return x.tamanhoMB}))), '--a');
-    grafico('gDbEscrita', bh.map(function(x){return x.msEscrita}), Math.max(10, Math.max.apply(null,bh.map(function(x){return x.msEscrita}))), '--at');
-    grafico('gDbLeitura', bh.map(function(x){return x.msLeitura}), Math.max(10, Math.max.apply(null,bh.map(function(x){return x.msLeitura}))), '--ok');
+
     $('ips').innerHTML = s.pedidos.porIp.map(function(x){
       return '<tr><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+x.pedidos+'</td><td>'+x.unidades+'</td><td>há '+x.ultimoHaSeg+' s</td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
     }).join('') || '<tr><td colspan="5">Nenhum pedido no último minuto.</td></tr>';
+
     $('ultimos').innerHTML = s.pedidos.ultimos.map(function(x){
       return '<tr><td>há '+x.haSeg+' s</td><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+esc(x.item)+'</td><td><b>'+x.quantidade+'</b></td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
     }).join('') || '<tr><td colspan="5">Nenhum pedido ainda. Abra /pedido no celular.</td></tr>';
+
     var c = s.requisicoes.classes;
     $('reqs').innerHTML = simples('Total de requisições', s.requisicoes.total, 'desde que ligou') + simples('Requisições/s', s.requisicoes.rps, 'média dos últimos 2 s') +
       simples('2xx (sucesso)', c['2xx'], 'respostas boas') + simples('4xx (erro do cliente)', c['4xx'], 'pedido inválido') + simples('5xx (erro do servidor)', c['5xx'], 'falhas') +
@@ -422,17 +429,19 @@ async function atualizar(){
   }catch(e){ $('info').textContent = 'Sem conexão com o servidor... tentando de novo'; }
 }
 atualizar(); setInterval(atualizar, 1000); window.addEventListener('resize', atualizar);
+atualizarBanco(); setInterval(atualizarBanco, 5000);
 </script></body></html>`;
 
+// ================= HTTP =================
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
-const SEM_METRICA = new Set(['/api/monitor', '/health', '/api/reset']);
+const SEM_METRICA = new Set(['/api/monitor', '/api/banco/pedidos', '/health', '/api/reset']); // nao contam como "requisicoes"
 
 function ipDoCliente(req) {
-  const xf = req.headers['x-forwarded-for'];
+  const xf = req.headers['x-forwarded-for']; // o Render coloca o IP real do visitante aqui
   const ip = xf ? xf.split(',')[0].trim() : req.socket.remoteAddress || 'desconhecido';
   return ip.replace(/^::ffff:/, '');
 }
@@ -453,32 +462,37 @@ async function criarPedido(body, req) {
     return { status: 400, dados: { erro: 'quantidade deve ser um numero inteiro de 1 a 500' } };
 
   const teste = ['cpu', 'ram', 'lento', 'erro'].includes(body.teste) ? body.teste : '';
-  const simulado = ipValido(body.ipSimulado);
+  const simulado = ipValido(body.ipSimulado);            // para simular muitos IPs diferentes
   const ip = simulado ? body.ipSimulado : ipDoCliente(req);
 
-  const doIp = await contarPedidosIp(ip);
+  // 429 (4xx): mesmo IP mandando demais
+  const corte = Date.now() - JANELA_S * 1000;
+  const doIp = pedidos.filter((p) => p.ip === ip && p.t >= corte).length;
   if (doIp >= IP_BLOQUEIO)
     return { status: 429, dados: { erro: 'IP ' + ip + ' bloqueado: ' + doIp + ' pedidos no último minuto' } };
 
-  if ((await unidadesNaJanela()) >= LIM_CRITICO && Math.random() < 0.3)
+  // 503 (5xx): sistema critico recusa parte dos pedidos
+  if (unidadesNaJanela() >= LIM_CRITICO && Math.random() < 0.3)
     return { status: 503, dados: { erro: 'servidor sobrecarregado, tente de novo' } };
 
+  // 500 (5xx): erro forcado pelo teste
   if (teste === 'erro') {
     await dorme(200);
     return { status: 500, dados: { erro: 'falha simulada (teste de erro)' } };
   }
 
   const nivel = nivelQtd(quantidade);
-  const t = Date.now();
-  await inserirPedido(t, ip, item, quantidade, nivel, simulado);
+  const registro = { t: Date.now(), ip, item, quantidade, nivel, simulado };
+  pedidos.push(registro);
+  enfileirar(registro, teste);                           // grava no Supabase em segundo plano
   totalPedidos++; totalUnidades += quantidade;
   await simularTrabalho(quantidade, teste);
 
-  const unidades = await unidadesNaJanela();
+  const unidades = unidadesNaJanela();
   return { status: 201, dados: {
     ok: true, id: totalPedidos, ip, simulado, item, quantidade, nivelPedido: nivel,
     carga: { unidades, pct: +((unidades / LIM_CRITICO) * 100).toFixed(1) },
-    statusSistema: (await snapshot()).status.nivel,
+    statusSistema: snapshot().status.nivel,
   } };
 }
 
@@ -488,6 +502,7 @@ http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
 
+  // paginas
   if (req.method === 'GET' && caminho === '/monitor') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(PAGINA_MONITOR);
@@ -502,17 +517,22 @@ http.createServer(async (req, res) => {
     }
   }
 
+  // API
   let status = 200, dados;
   try {
-    if (req.method === 'GET' && caminho === '/api/monitor') dados = await snapshot();
+    if (req.method === 'GET' && caminho === '/api/monitor') dados = snapshot();
     else if (req.method === 'GET' && caminho === '/health') dados = { status: 'ok' };
+    else if (req.method === 'GET' && caminho === '/api/banco/pedidos') {
+      if (!DB_ATIVO) dados = { linhas: [], erro: 'Banco não configurado (SUPABASE_URL / SUPABASE_KEY).' };
+      else {
+        try { dados = { linhas: await dbFetch('pedidos?select=id,criado_em,ip,item,quantidade,nivel,simulado&order=id.desc&limit=10') }; }
+        catch { dados = { linhas: [], erro: 'Erro ao ler o banco: ' + db.ultimoErro }; }
+      }
+    }
     else if (req.method === 'POST' && caminho === '/api/pedido') ({ status, dados } = await criarPedido(await lerBody(req), req));
     else if (req.method === 'POST' && caminho === '/api/reset') {
-      await supabase.from('pedidos').delete().neq('id', 0);
-      await supabase.from('db_metricas').delete().neq('id', 0);
-      historico.length = 0;
+      pedidos = []; reqEventos = []; historico.length = 0;
       totalReq = totalPedidos = totalUnidades = 0; classes['2xx'] = classes['4xx'] = classes['5xx'] = 0;
-      dbEscritas = dbLeituras = 0; msUltimaEscrita = msUltimaLeitura = 0;
       dados = { ok: true };
     } else { status = 404; dados = { erro: 'rota nao encontrada' }; }
   } catch (e) {
