@@ -7,8 +7,8 @@ const { monitorEventLoopDelay } = require('perf_hooks');
 
 const PORTA = process.env.PORT || 3000;
 const JANELA_S = Number(process.env.JANELA_S || 60);          // a "carga" conta os pedidos dos ultimos 60 s
-const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 15);    // unidades na janela: >= 11 -> ATENCAO
-const LIM_CRITICO = Number(process.env.LIM_CRITICO || 25);    // unidades na janela: >= 20 -> CRITICO
+const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 15);    // unidades na janela: >= 15 -> ATENCAO
+const LIM_CRITICO = Number(process.env.LIM_CRITICO || 25);    // unidades na janela: >= 25 -> CRITICO
 const IP_ATENCAO = Number(process.env.IP_ATENCAO || 5);       // pedidos de um mesmo IP na janela
 const IP_CRITICO = Number(process.env.IP_CRITICO || 10);
 const IP_BLOQUEIO = Number(process.env.IP_BLOQUEIO || 10);    // pedidos do mesmo IP/min -> 429 (bloqueado)
@@ -284,17 +284,16 @@ const PAGINA_MONITOR = String.raw`<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Monitor ao vivo</title>
 <style>
-:root{--bg:#f5f6f8;--card:#fff;--txt:#1c1e21;--mut:#6b7280;--bd:#e5e7eb;--ok:#16a34a;--at:#d97706;--cr:#dc2626;--a:#2563eb}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--txt:#e8eaed;--mut:#9aa0a6;--bd:#2a2e36;--ok:#4ade80;--at:#fbbf24;--cr:#f87171;--a:#60a5fa}}
-*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--txt);padding:16px}
+:root{--bg:#f5f6f8;--card:#fff;--txt:#1c1e21;--mut:#6b7280;--bd:#e5e7eb;--ok:#16a34a;--at:#d97706;--cr:#dc2626}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--txt:#e8eaed;--mut:#9aa0a6;--bd:#2a2e36;--ok:#4ade80;--at:#fbbf24;--cr:#f87171}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--txt);padding:16px;max-width:900px;margin:0 auto}
 .top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 h1{font-size:20px;margin:0}h2{font-size:15px;margin:20px 0 10px}.sub{color:var(--mut);font-size:12px}
-a,button.link{color:var(--a);text-decoration:none;font-size:14px;background:none;border:0;cursor:pointer;padding:0}
+a,button.link{color:#2563eb;text-decoration:none;font-size:14px;background:none;border:0;cursor:pointer;padding:0}
 #banner{border-radius:12px;padding:16px 20px;color:#fff;background:var(--ok)}
 #banner.ATENCAO{background:var(--at)}#banner.CRITICO{background:var(--cr)}
 #banner .t{font-size:24px;font-weight:700}#banner ul{margin:8px 0 0;padding-left:18px;font-size:14px}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(155px,1fr))}
-.charts{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px}
 .lbl{font-size:12px;color:var(--mut)}.val{font-size:24px;font-weight:600;margin:4px 0 8px}
 .barra{height:8px;background:var(--bd);border-radius:4px;overflow:hidden}.barra i{display:block;height:100%;border-radius:4px;transition:width .4s}
@@ -303,8 +302,6 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;p
 .OK{background:var(--ok)}.ATENCAO{background:var(--at)}.CRITICO{background:var(--cr)}
 .sim{font-size:11px;color:var(--mut);border:1px solid var(--bd);border-radius:4px;padding:0 4px;margin-left:4px}
 canvas{width:100%;height:130px;display:block}
-.dist{display:flex;height:26px;border-radius:6px;overflow:hidden;background:var(--bd)}.dist div{display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:600;transition:width .4s}
-.leg{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px}
 </style></head><body>
 <div class="top"><div><h1>📡 Monitor ao vivo</h1><div class="sub" id="info">Conectando... (no plano gratuito do Render o servidor pode levar ~1 min para acordar)</div></div>
 <div><a href="/pedido">Fazer pedido →</a> &nbsp; <button class="link" onclick="zerar()">Zerar dados</button></div></div>
@@ -314,29 +311,16 @@ canvas{width:100%;height:130px;display:block}
 <h2>Situação agora</h2>
 <div class="grid" id="cards"></div>
 
-<h2>Pedidos no último minuto: % bom / atenção / crítico</h2>
-<div class="card"><div class="dist" id="dist"></div><div class="leg" id="legenda"></div></div>
-
-<h2>Gráficos (últimos ~3 min)</h2>
-<div class="charts">
-<div class="card"><div class="lbl">Carga de pedidos (%)</div><canvas id="gCarga"></canvas></div>
-<div class="card"><div class="lbl">CPU (%)</div><canvas id="gCpu"></canvas></div>
-<div class="card"><div class="lbl">Memória RAM (MB)</div><canvas id="gRam"></canvas></div>
-</div>
+<h2>Carga de pedidos (%)</h2>
+<div class="card"><canvas id="gCarga"></canvas></div>
 
 <h2>Pedidos por IP (último minuto)</h2>
-<div class="card wrap"><table><thead><tr><th>IP</th><th>Pedidos</th><th>Unidades</th><th>Último</th><th>Nível</th></tr></thead><tbody id="ips"></tbody></table></div>
+<div class="card wrap"><table><thead><tr><th>IP</th><th>Pedidos</th><th>Unidades</th><th>Nível</th></tr></thead><tbody id="ips"></tbody></table></div>
 
 <h2>Últimos pedidos</h2>
 <div class="card wrap"><table><thead><tr><th>Quando</th><th>IP</th><th>Item</th><th>Qtd</th><th>Nível</th></tr></thead><tbody id="ultimos"></tbody></table></div>
 
-<h2>Banco de dados (Supabase)</h2>
-<div class="grid" id="dbCards"></div>
-<div class="card wrap" style="margin-top:12px"><div class="lbl" style="margin-bottom:6px">Últimos pedidos gravados no banco</div>
-<table><thead><tr><th>#</th><th>Quando</th><th>IP</th><th>Item</th><th>Qtd</th><th>Nível</th></tr></thead><tbody id="dbRows"></tbody></table></div>
-
-<h2>Requisições</h2>
-<div class="grid" id="reqs"></div>
+<p class="sub" id="reqs"></p>
 
 <script>
 var $ = function(id){return document.getElementById(id)};
@@ -350,9 +334,6 @@ function card(titulo, valor, pct, nivel, sub){
   return '<div class="card" style="border-top:4px solid '+COR[nivel]+'"><div class="lbl">'+titulo+'</div><div class="val">'+valor+
     '</div><div class="barra"><i style="width:'+Math.min(100,pct)+'%;background:'+COR[nivel]+'"></i></div><div class="sub" style="margin-top:6px">'+sub+'</div></div>';
 }
-function simples(titulo, valor, sub){
-  return '<div class="card"><div class="lbl">'+titulo+'</div><div class="val">'+valor+'</div><div class="sub">'+sub+'</div></div>';
-}
 function grafico(id, dados, max, cor){
   var c=$(id), d=window.devicePixelRatio||1, w=c.clientWidth, h=c.clientHeight;
   c.width=w*d; c.height=h*d; var g=c.getContext('2d'); g.scale(d,d);
@@ -364,74 +345,42 @@ function grafico(id, dados, max, cor){
 }
 async function zerar(){ if(confirm('Apagar pedidos e métricas da memória? (os dados gravados no banco são mantidos)')){ await fetch('/api/reset',{method:'POST'}); atualizar(); } }
 
-function cardsBanco(b, nivel){
-  if(!b.configurado) return simples('Banco de dados','não configurado','defina SUPABASE_URL e SUPABASE_KEY no Render');
+function cardBanco(b, nivel){
+  if(!b.configurado) return '<div class="card"><div class="lbl">Banco de dados</div><div class="val">desativado</div><div class="sub">defina SUPABASE_URL e SUPABASE_KEY</div></div>';
   var valor = b.ok===false ? 'OFFLINE' : b.ok===null ? 'testando...' : b.p95Ms+' ms';
-  var sub = 'fila '+b.fila+' · gravados '+b.gravados+' · erros '+b.erros+(b.descartados?' · perdidos '+b.descartados:'');
-  var c = card('Banco: latência p95', valor, b.ok===false?100:b.p95Ms/8, nivel, sub);
-  if(b.ok===false) c += simples('Último erro', '<span style="font-size:14px">'+esc(b.ultimoErro)+'</span>', 'há '+b.ultimoErroHaSeg+' s');
-  c += simples('Dados no banco', (b.linhasPedidos===null?'?':b.linhasPedidos)+' pedidos', (b.linhasMetricas===null?'?':b.linhasMetricas)+' registros de métricas');
-  c += simples('Tamanho do banco', (b.tamanhoMB===null?'?':b.tamanhoMB+' MB'), 'plano gratuito: 500 MB');
-  c += simples('Conexões', b.conexoes===null?'?':b.conexoes, b.pingHaSeg===null?'sem leitura ainda':'lido há '+b.pingHaSeg+' s');
-  return c;
-}
-
-async function atualizarBanco(){
-  try{
-    var r = await (await fetch('/api/banco/pedidos')).json();
-    $('dbRows').innerHTML = (r.linhas||[]).map(function(x){
-      return '<tr><td>'+x.id+'</td><td>'+new Date(x.criado_em).toLocaleTimeString()+'</td><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+esc(x.item)+'</td><td><b>'+x.quantidade+'</b></td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
-    }).join('') || '<tr><td colspan="6">'+(r.erro ? esc(r.erro) : 'Nenhum pedido gravado ainda.')+'</td></tr>';
-  }catch(e){ $('dbRows').innerHTML = '<tr><td colspan="6">Não foi possível ler o banco.</td></tr>'; }
+  var sub = b.ok===false ? esc(b.ultimoErro) : (b.linhasPedidos===null?'?':b.linhasPedidos)+' pedidos gravados · fila '+b.fila+(b.descartados?' · perdidos '+b.descartados:'');
+  return card('Banco (latência p95)', valor, b.ok===false?100:b.p95Ms/8, nivel, sub);
 }
 
 async function atualizar(){
   try{
     var s = await (await fetch('/api/monitor')).json();
-    var h = s.historico;
-    $('info').textContent = 'Ao vivo · atualiza a cada 1 s · ligado há '+Math.floor(s.uptimeSeg/60)+' min '+(s.uptimeSeg%60)+' s · janela de '+s.janelaSeg+' s';
+    var h = s.historico, n = s.niveis;
+    $('info').textContent = 'Ao vivo · ligado há '+Math.floor(s.uptimeSeg/60)+' min '+(s.uptimeSeg%60)+' s';
     $('banner').className = s.status.nivel; $('bTitulo').textContent = TITULO[s.status.nivel];
     $('bMotivos').innerHTML = s.status.motivos.map(function(m){return '<li>'+esc(m)+'</li>'}).join('') || '<li>Tudo funcionando normalmente.</li>';
 
-    var n = s.niveis;
     $('cards').innerHTML =
-      card('Carga de pedidos', s.carga.pct.toFixed(0)+'%', s.carga.pct, n.carga, s.carga.unidades+' un. no último minuto (atenção ≥ '+s.limites.atencao+', crítico ≥ '+s.limites.critico+')') +
-      card('CPU', s.cpu.pct.toFixed(0)+'%', s.cpu.pct, n.cpu, s.cpu.cores+' núcleo(s) · load '+s.cpu.load1) +
-      card('Memória RAM', s.ram.rssMB+' MB', s.ram.pct, n.ram, s.ram.pct.toFixed(0)+'% de '+s.ram.limiteMB+' MB · heap '+s.ram.heapMB+' MB') +
-      card('Latência p95', s.requisicoes.p95Ms+' ms', s.requisicoes.p95Ms/10, n.latencia, 'event loop: '+s.eventLoopMs+' ms') +
-      card('Erros 5xx', s.requisicoes.erros5xx, s.requisicoes.erros5xx*20, n.erros, 'no último minuto') +
-      card('IP mais ativo', s.pedidos.porIp.length ? s.pedidos.porIp[0].pedidos+' pedidos' : '0', s.pedidos.porIp.length ? s.pedidos.porIp[0].pedidos*10 : 0, n.ip, s.pedidos.janela.ipsDistintos+' IP(s) diferentes');
-
-    $('dbCards').innerHTML = cardsBanco(s.banco, n.banco);
-
-    var j = s.pedidos.janela, p = j.pct;
-    $('dist').innerHTML = j.qtd ? ['OK','ATENCAO','CRITICO'].map(function(k){
-      return p[k] ? '<div style="width:'+p[k]+'%;background:'+COR[k]+'">'+(p[k]>=8 ? p[k].toFixed(0)+'%' : '')+'</div>' : '';}).join('')
-      : '<div style="width:100%;color:var(--mut)">sem pedidos no último minuto</div>';
-    $('legenda').innerHTML = ['OK','ATENCAO','CRITICO'].map(function(k){
-      return '<span><span class="tag '+k+'">'+NOME[k]+'</span> '+p[k].toFixed(1)+'% ('+j.distribuicao[k]+')</span>';}).join('') +
-      '<span class="sub">Total: '+j.qtd+' pedidos · '+j.unidades+' unidades</span>';
+      card('Carga de pedidos', s.carga.pct.toFixed(0)+'%', s.carga.pct, n.carga, s.carga.unidades+' un. no último minuto') +
+      card('CPU', s.cpu.pct.toFixed(0)+'%', s.cpu.pct, n.cpu, s.cpu.cores+' núcleo(s)') +
+      card('Memória RAM', s.ram.rssMB+' MB', s.ram.pct, n.ram, s.ram.pct.toFixed(0)+'% de '+s.ram.limiteMB+' MB') +
+      cardBanco(s.banco, n.banco);
 
     grafico('gCarga', h.map(function(x){return x.carga}), Math.max(100, Math.max.apply(null,h.map(function(x){return x.carga}))), '--at');
-    grafico('gCpu', h.map(function(x){return x.cpu}), 100, '--a');
-    grafico('gRam', h.map(function(x){return x.ram}), s.ram.limiteMB, '--ok');
 
     $('ips').innerHTML = s.pedidos.porIp.map(function(x){
-      return '<tr><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+x.pedidos+'</td><td>'+x.unidades+'</td><td>há '+x.ultimoHaSeg+' s</td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
-    }).join('') || '<tr><td colspan="5">Nenhum pedido no último minuto.</td></tr>';
+      return '<tr><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+x.pedidos+'</td><td>'+x.unidades+'</td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
+    }).join('') || '<tr><td colspan="4">Nenhum pedido no último minuto.</td></tr>';
 
     $('ultimos').innerHTML = s.pedidos.ultimos.map(function(x){
       return '<tr><td>há '+x.haSeg+' s</td><td>'+esc(x.ip)+(x.simulado?'<span class="sim">simulado</span>':'')+'</td><td>'+esc(x.item)+'</td><td><b>'+x.quantidade+'</b></td><td><span class="tag '+x.nivel+'">'+NOME[x.nivel]+'</span></td></tr>';
     }).join('') || '<tr><td colspan="5">Nenhum pedido ainda. Abra /pedido no celular.</td></tr>';
 
-    var c = s.requisicoes.classes;
-    $('reqs').innerHTML = simples('Total de requisições', s.requisicoes.total, 'desde que ligou') + simples('Requisições/s', s.requisicoes.rps, 'média dos últimos 2 s') +
-      simples('2xx (sucesso)', c['2xx'], 'respostas boas') + simples('4xx (erro do cliente)', c['4xx'], 'pedido inválido') + simples('5xx (erro do servidor)', c['5xx'], 'falhas') +
-      simples('Pedidos / unidades', s.pedidos.total+' / '+s.pedidos.unidadesTotal, 'desde que ligou');
+    var r = s.requisicoes, c = r.classes;
+    $('reqs').textContent = 'Requisições: '+r.total+' no total · '+r.rps+'/s · sucesso '+c['2xx']+' · erro do cliente '+c['4xx']+' · erro do servidor '+c['5xx']+' · latência p95 '+r.p95Ms+' ms';
   }catch(e){ $('info').textContent = 'Sem conexão com o servidor... tentando de novo'; }
 }
 atualizar(); setInterval(atualizar, 1000); window.addEventListener('resize', atualizar);
-atualizarBanco(); setInterval(atualizarBanco, 5000);
 </script></body></html>`;
 
 // ================= HTTP =================
