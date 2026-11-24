@@ -7,11 +7,11 @@ const { monitorEventLoopDelay } = require('perf_hooks');
 
 const PORTA = process.env.PORT || 3000;
 const JANELA_S = Number(process.env.JANELA_S || 60);          // a "carga" conta os pedidos dos ultimos 60 s
-const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 11);    // unidades na janela: >= 11 -> ATENCAO
-const LIM_CRITICO = Number(process.env.LIM_CRITICO || 20);    // unidades na janela: >= 20 -> CRITICO
+const LIM_ATENCAO = Number(process.env.LIM_ATENCAO || 15);    // unidades na janela: >= 11 -> ATENCAO
+const LIM_CRITICO = Number(process.env.LIM_CRITICO || 25);    // unidades na janela: >= 20 -> CRITICO
 const IP_ATENCAO = Number(process.env.IP_ATENCAO || 5);       // pedidos de um mesmo IP na janela
 const IP_CRITICO = Number(process.env.IP_CRITICO || 10);
-const IP_BLOQUEIO = Number(process.env.IP_BLOQUEIO || 15);    // pedidos do mesmo IP/min -> 429 (bloqueado)
+const IP_BLOQUEIO = Number(process.env.IP_BLOQUEIO || 10);    // pedidos do mesmo IP/min -> 429 (bloqueado)
 const MAX_RETIDO_MB = Number(process.env.MAX_RETIDO_MB || 300); // teto de RAM retida pelo simulador
 const RAM_LIMITE_MB = Number(process.env.RAM_LIMITE_MB || 512); // plano gratis do Render = 512 MB
 const SIMULAR_CARGA = process.env.SIMULAR_CARGA !== 'false';  // pedido grande gasta CPU/RAM de verdade (para o monitor reagir)
@@ -22,6 +22,10 @@ const DB_ATIVO = Boolean(SUPABASE_URL && SUPABASE_KEY);
 const DB_TIMEOUT_MS = Number(process.env.DB_TIMEOUT_MS || 8000);
 const DB_FILA_MAX = Number(process.env.DB_FILA_MAX || 1000);  // pedidos esperando para gravar (se passar, descarta os mais antigos)
 
+<<<<<<< HEAD
+=======
+// ================= ESTADO =================
+>>>>>>> 4c62fba (adiciona pedido.html)
 const iniciadoEm = Date.now();
 let pedidos = [];          // {t, ip, item, quantidade, nivel, simulado}
 let reqEventos = [];       // {t, ms, status}
@@ -39,6 +43,10 @@ const nivelQtd = (q) => nivelFaixa(q, LIM_ATENCAO, LIM_CRITICO);
 const ORDEM = { OK: 0, ATENCAO: 1, CRITICO: 2 };
 const pior = (lista) => lista.reduce((a, b) => (ORDEM[b] > ORDEM[a] ? b : a), 'OK');
 
+<<<<<<< HEAD
+=======
+// ================= BANCO DE DADOS (Supabase via REST) =================
+>>>>>>> 4c62fba (adiciona pedido.html)
 const db = {
   ok: null,                // null = ainda nao testou | true | false
   ultimoErro: '', ultimoErroEm: 0,
