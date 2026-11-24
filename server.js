@@ -22,10 +22,7 @@ const DB_ATIVO = Boolean(SUPABASE_URL && SUPABASE_KEY);
 const DB_TIMEOUT_MS = Number(process.env.DB_TIMEOUT_MS || 8000);
 const DB_FILA_MAX = Number(process.env.DB_FILA_MAX || 1000);  // pedidos esperando para gravar (se passar, descarta os mais antigos)
 
-<<<<<<< HEAD
-=======
-// ================= ESTADO =================
->>>>>>> 4c62fba (adiciona pedido.html)
+
 const iniciadoEm = Date.now();
 let pedidos = [];          // {t, ip, item, quantidade, nivel, simulado}
 let reqEventos = [];       // {t, ms, status}
@@ -43,10 +40,7 @@ const nivelQtd = (q) => nivelFaixa(q, LIM_ATENCAO, LIM_CRITICO);
 const ORDEM = { OK: 0, ATENCAO: 1, CRITICO: 2 };
 const pior = (lista) => lista.reduce((a, b) => (ORDEM[b] > ORDEM[a] ? b : a), 'OK');
 
-<<<<<<< HEAD
-=======
-// ================= BANCO DE DADOS (Supabase via REST) =================
->>>>>>> 4c62fba (adiciona pedido.html)
+
 const db = {
   ok: null,                // null = ainda nao testou | true | false
   ultimoErro: '', ultimoErroEm: 0,
